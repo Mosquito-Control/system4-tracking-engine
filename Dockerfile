@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY system4/ ./system4/
+COPY migrations/ ./migrations/
 
 EXPOSE 8080
 

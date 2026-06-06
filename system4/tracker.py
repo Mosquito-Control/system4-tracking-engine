@@ -22,6 +22,7 @@ from .db import (
     RawPosition,
     TrackRow,
     count_active_tracks,
+    delete_old_lost_tracks,
     fetch_active_tracks,
     fetch_new_positions,
     insert_track,
@@ -37,6 +38,9 @@ ASSOC_DIST_M = float(os.getenv("ASSOC_DIST_M", "50"))
 ASSOC_TIME_S = float(os.getenv("ASSOC_TIME_S", "3.0"))
 LOST_AFTER_S = float(os.getenv("LOST_AFTER_S", "10.0"))
 LOOP_INTERVAL_S = float(os.getenv("LOOP_INTERVAL_S", "1.0"))
+# Hard-delete tracks that have been 'lost' for longer than this. Prevents
+# unbounded growth of the tracks/track_points tables during continuous run.
+PURGE_AFTER_S = float(os.getenv("PURGE_AFTER_S", "3600"))  # 1 hour
 
 
 def _seconds_between(a: datetime, b: datetime) -> float:
@@ -67,7 +71,9 @@ async def run_loop(pool: asyncpg.Pool) -> None:
     # within the same tick. Refreshed from DB at the start of each tick.
     active_tracks: list[TrackRow] = []
 
-    log.info("Tracker loop started (dist=%.0fm  time=%.1fs  lost=%.1fs)", ASSOC_DIST_M, ASSOC_TIME_S, LOST_AFTER_S)
+    log.info("Tracker loop started (dist=%.0fm  time=%.1fs  lost=%.1fs  purge=%.0fs)",
+             ASSOC_DIST_M, ASSOC_TIME_S, LOST_AFTER_S, PURGE_AFTER_S)
+    tick = 0
 
     while True:
         try:
@@ -82,7 +88,14 @@ async def run_loop(pool: asyncpg.Pool) -> None:
 
                     if match:
                         await update_track(pool, match.id, pos)
-                        await insert_track_point(pool, match.id, pos)
+                        # FK on track_points.position_id can fire if S2's
+                        # commit hasn't propagated yet — skip the point but
+                        # keep the track update so we don't lose the tick.
+                        try:
+                            await insert_track_point(pool, match.id, pos)
+                        except asyncpg.ForeignKeyViolationError:
+                            log.warning("track_point FK miss (track=%d, pos=%d) — skipped",
+                                        match.id, pos.id)
                         # Update in-memory state so later positions in this
                         # tick can link to the same track with updated coords.
                         match.last_lat = pos.lat
@@ -92,7 +105,11 @@ async def run_loop(pool: asyncpg.Pool) -> None:
                         match.point_count += 1
                     else:
                         new_id = await insert_track(pool, pos)
-                        await insert_track_point(pool, new_id, pos)
+                        try:
+                            await insert_track_point(pool, new_id, pos)
+                        except asyncpg.ForeignKeyViolationError:
+                            log.warning("track_point FK miss on new track (pos=%d) — skipped",
+                                        pos.id)
                         active_tracks.append(
                             TrackRow(
                                 id=new_id,
@@ -111,6 +128,10 @@ async def run_loop(pool: asyncpg.Pool) -> None:
                 log.debug("Processed %d positions → %d active tracks", len(new_positions), n)
 
             await mark_lost_tracks(pool, LOST_AFTER_S)
+            # Hard-delete old lost tracks every ~60 ticks (~1 min at default).
+            tick += 1
+            if tick % 60 == 0:
+                await delete_old_lost_tracks(pool, PURGE_AFTER_S)
 
         except asyncio.CancelledError:
             log.info("Tracker loop cancelled")

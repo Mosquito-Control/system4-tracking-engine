@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .db import (
+    apply_migrations,
     close_pool,
     count_active_tracks,
     get_pool,
@@ -36,6 +37,7 @@ _tracker_task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
 async def lifespan(app: FastAPI):
     global _tracker_task
     pool = await get_pool()
+    await apply_migrations(pool)
     _tracker_task = asyncio.create_task(run_loop(pool), name="tracker-loop")
     log.info("Tracker loop task started")
     try:

@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import asyncpg
 
+log = logging.getLogger(__name__)
+
 _pool: Optional[asyncpg.Pool] = None
+_MIGRATIONS_DIR = Path(__file__).parent.parent / "migrations"
 
 
 async def get_pool() -> asyncpg.Pool:
@@ -22,6 +27,27 @@ async def get_pool() -> asyncpg.Pool:
             command_timeout=10,
         )
     return _pool
+
+
+async def apply_migrations(pool: asyncpg.Pool) -> None:
+    """Run every .sql file in migrations/ in lexical order.
+
+    Each file is wrapped in a transaction; statements use IF NOT EXISTS so
+    re-runs are no-ops. Crashes loudly if the migrations dir is missing,
+    rather than letting the app boot against a schema-less DB.
+    """
+    if not _MIGRATIONS_DIR.is_dir():
+        raise RuntimeError(f"migrations dir not found: {_MIGRATIONS_DIR}")
+    files = sorted(_MIGRATIONS_DIR.glob("*.sql"))
+    if not files:
+        log.warning("No migrations found in %s", _MIGRATIONS_DIR)
+        return
+    async with pool.acquire() as conn:
+        for f in files:
+            sql = f.read_text()
+            async with conn.transaction():
+                await conn.execute(sql)
+            log.info("Applied migration: %s", f.name)
 
 
 async def close_pool() -> None:
@@ -158,6 +184,30 @@ async def mark_lost_tracks(pool: asyncpg.Pool, lost_after_s: float) -> None:
              AND last_seen < NOW() - ($1 || ' seconds')::INTERVAL""",
         str(lost_after_s),
     )
+
+
+async def delete_old_lost_tracks(pool: asyncpg.Pool, purge_after_s: float) -> int:
+    """Hard-delete tracks that have been 'lost' beyond purge_after_s.
+
+    Cascades to track_points via the FK (no explicit cascade — done manually
+    to avoid an existing-schema migration). Returns rows deleted.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            ids = await conn.fetch(
+                """SELECT id FROM tracks
+                   WHERE status = 'lost'
+                     AND last_seen < NOW() - ($1 || ' seconds')::INTERVAL""",
+                str(purge_after_s),
+            )
+            if not ids:
+                return 0
+            id_list = [r["id"] for r in ids]
+            await conn.execute(
+                "DELETE FROM track_points WHERE track_id = ANY($1::int[])", id_list
+            )
+            await conn.execute("DELETE FROM tracks WHERE id = ANY($1::int[])", id_list)
+            return len(id_list)
 
 
 async def health_check(pool: asyncpg.Pool) -> bool:
