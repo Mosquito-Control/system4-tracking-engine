@@ -38,6 +38,16 @@ ASSOC_DIST_M = float(os.getenv("ASSOC_DIST_M", "50"))
 ASSOC_TIME_S = float(os.getenv("ASSOC_TIME_S", "3.0"))
 LOST_AFTER_S = float(os.getenv("LOST_AFTER_S", "10.0"))
 LOOP_INTERVAL_S = float(os.getenv("LOOP_INTERVAL_S", "1.0"))
+# Position smoothing — per-frame triangulation noise across cam-pairs spreads
+# the same physical drone's fix by 50–200 m horizontally. SMOOTH_ALPHA is the
+# weight given to a NEW raw position when updating the track's displayed
+# position (exponential moving average):
+#   new_track_pos = α * raw_new + (1 - α) * old_track_pos
+# Lower α = smoother dot, more lag behind a moving drone. At 10 m/s with
+# α=0.15 the dot lags ~7 m behind a steady-state drone but cuts spike
+# amplitude by ~85%. Raw positions are still written to track_points so
+# the history overlay sees the unsmoothed trail.
+SMOOTH_ALPHA = float(os.getenv("SMOOTH_ALPHA", "0.15"))
 # Hard-delete tracks that have been 'lost' for longer than this. Prevents
 # unbounded growth of the tracks/track_points tables during continuous run.
 PURGE_AFTER_S = float(os.getenv("PURGE_AFTER_S", "3600"))  # 1 hour
@@ -66,7 +76,12 @@ def _find_best_track(pos: RawPosition, active: list[TrackRow]) -> Optional[Track
 
 
 async def run_loop(pool: asyncpg.Pool) -> None:
-    cursor: Optional[datetime] = None
+    # Cold-start cursor at NOW() — do NOT replay the recent backlog. The 60s
+    # bootstrap window used to dump thousands of positions through the greedy
+    # NN matcher in a single tick, which (a) collapsed all visible drones
+    # into one mega-track via EMA centroid drift and (b) lagged the cursor
+    # so far that subsequent ticks couldn't catch up and the loop wedged.
+    cursor: Optional[datetime] = datetime.now(tz=timezone.utc)
     # In-memory mirror of active tracks so we don't re-query after every point
     # within the same tick. Refreshed from DB at the start of each tick.
     active_tracks: list[TrackRow] = []
@@ -87,7 +102,22 @@ async def run_loop(pool: asyncpg.Pool) -> None:
                     match = _find_best_track(pos, active_tracks)
 
                     if match:
-                        await update_track(pool, match.id, pos)
+                        # EMA smoothing — the track's displayed (lat,lon,alt)
+                        # is a weighted blend of the raw new fix and the
+                        # current smoothed estimate. Pulls the dot back
+                        # toward where the drone has been even when one
+                        # cam-pair's triangulation flings the raw fix 100 m
+                        # off. Raw `pos` is still written to track_points
+                        # below, so trail/history sees the unsmoothed feed.
+                        sm_lat = SMOOTH_ALPHA * pos.lat + (1 - SMOOTH_ALPHA) * match.last_lat
+                        sm_lon = SMOOTH_ALPHA * pos.lon + (1 - SMOOTH_ALPHA) * match.last_lon
+                        sm_alt = SMOOTH_ALPHA * pos.alt_m + (1 - SMOOTH_ALPHA) * match.last_alt_m
+                        sm_pos = RawPosition(
+                            id=pos.id, timestamp=pos.timestamp,
+                            lat=sm_lat, lon=sm_lon, alt_m=sm_alt,
+                            cam_pair=pos.cam_pair, inserted_at=pos.inserted_at,
+                        )
+                        await update_track(pool, match.id, sm_pos)
                         # FK on track_points.position_id can fire if S2's
                         # commit hasn't propagated yet — skip the point but
                         # keep the track update so we don't lose the tick.
@@ -98,9 +128,9 @@ async def run_loop(pool: asyncpg.Pool) -> None:
                                         match.id, pos.id)
                         # Update in-memory state so later positions in this
                         # tick can link to the same track with updated coords.
-                        match.last_lat = pos.lat
-                        match.last_lon = pos.lon
-                        match.last_alt_m = pos.alt_m
+                        match.last_lat = sm_lat
+                        match.last_lon = sm_lon
+                        match.last_alt_m = sm_alt
                         match.last_seen = pos.timestamp
                         match.point_count += 1
                     else:

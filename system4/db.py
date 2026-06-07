@@ -81,22 +81,22 @@ class TrackRow:
 
 
 async def fetch_new_positions(pool: asyncpg.Pool, since: Optional[datetime]) -> list[RawPosition]:
-    if since is None:
-        # On cold start fetch last 60 seconds to bootstrap any tracks
-        rows = await pool.fetch(
-            """SELECT id, timestamp, lat, lon, alt_m, cam_pair, inserted_at
-               FROM positions
-               WHERE inserted_at > NOW() - INTERVAL '60 seconds'
-               ORDER BY inserted_at ASC""",
-        )
-    else:
-        rows = await pool.fetch(
-            """SELECT id, timestamp, lat, lon, alt_m, cam_pair, inserted_at
-               FROM positions
-               WHERE inserted_at > $1
-               ORDER BY inserted_at ASC""",
-            since,
-        )
+    # Caller is expected to initialise `since` at cold start (run_loop does
+    # this via datetime.now). We bounded LIMIT to keep a single tick's work
+    # finite — at S2's ~50 pos/s the loop's per-position UPDATE/INSERT round
+    # trips can lag the cursor; without a cap, one bad tick snowballs into
+    # a wedged loop. 100 ≈ 2s of real-time emission, which is roughly the
+    # most we can chew through before the next tick fires.
+    where = "WHERE inserted_at > $1" if since is not None else "WHERE inserted_at > NOW()"
+    args = (since,) if since is not None else ()
+    rows = await pool.fetch(
+        f"""SELECT id, timestamp, lat, lon, alt_m, cam_pair, inserted_at
+            FROM positions
+            {where}
+            ORDER BY inserted_at ASC
+            LIMIT 100""",
+        *args,
+    )
     return [
         RawPosition(
             id=r["id"],

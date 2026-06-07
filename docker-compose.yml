@@ -1,0 +1,26 @@
+# Local-only compose for the S4 tracking engine.
+# DATABASE_URL targets the shared local PG on host.docker.internal so it
+# reads positions written by S2 and writes tracks/track_points consumed
+# by the System 3 dashboard's /api/tracks route.
+services:
+  system4:
+    build: .
+    container_name: system4-tracking-engine
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgresql://droneadmin:localpassword@host.docker.internal:5432/dronedetection
+      # 200m / 8s with EMA smoothing (SMOOTH_ALPHA below): per-cam-pair
+      # triangulation noise can spike a single fix 150m+ from the true
+      # drone position. 100m was too tight — every spike spawned a new
+      # track and the threats panel filled with 30+ entries. 200m absorbs
+      # the spikes; the 3 Unity drones are 250m+ apart along the loop so
+      # they still resolve as distinct tracks, and the EMA smoothing keeps
+      # the displayed dot stable inside the noise envelope.
+      ASSOC_DIST_M: "200"
+      ASSOC_TIME_S: "30.0"
+      LOST_AFTER_S: "60.0"
+      LOOP_INTERVAL_S: "1.0"
+      PURGE_AFTER_S: "3600"
+      SMOOTH_ALPHA: "0.15"
+    restart: unless-stopped
