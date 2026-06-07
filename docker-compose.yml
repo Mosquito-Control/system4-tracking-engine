@@ -19,7 +19,7 @@ services:
       # the displayed dot stable inside the noise envelope.
       ASSOC_DIST_M: "200"
       ASSOC_TIME_S: "30.0"
-      LOST_AFTER_S: "60.0"
+      LOST_AFTER_S: "300.0"
       LOOP_INTERVAL_S: "1.0"
       PURGE_AFTER_S: "3600"
       SMOOTH_ALPHA: "0.15"
